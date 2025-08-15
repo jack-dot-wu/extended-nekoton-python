@@ -506,8 +506,9 @@ impl FunctionAbi {
         state_init: Option<&StateInit>,
         timeout: Option<u32>,
         clock: Option<&Clock>,
+        current_timestamp: Option<u64>,
     ) -> PyResult<UnsignedExternalMessage> {
-        let body = self.encode_external_input(input, public_key, timeout, Some(&dst), clock)?;
+        let body = self.encode_external_input(input, public_key, timeout, Some(&dst), clock, current_timestamp)?;
         Ok(UnsignedExternalMessage {
             dst: dst.0,
             state_init: state_init.cloned(),
@@ -522,15 +523,19 @@ impl FunctionAbi {
         timeout: Option<u32>,
         address: Option<&Address>,
         clock: Option<&Clock>,
+        current_timestamp: Option<u64>,
     ) -> PyResult<UnsignedBody> {
         use nt::utils::Clock;
 
         let tokens = parse_tokens(&self.0.inputs, input)?;
 
-        let now = match clock {
-            Some(clock) => clock.0.now_ms_u64(),
-            None => nt::utils::SimpleClock.now_ms_u64(),
+        // 如果提供了当前时间戳，使用它；否则使用clock或当前时间
+        let now = match (current_timestamp, clock) {
+            (Some(timestamp), _) => timestamp,
+            (None, Some(clock)) => clock.0.now_ms_u64(),
+            (None, None) => nt::utils::SimpleClock.now_ms_u64(),
         };
+
         let (expire_at, headers) = default_headers(
             now,
             nt::core::models::Expiration::Timeout(timeout.unwrap_or(DEFAULT_TIMEOUT)),
@@ -566,7 +571,7 @@ impl FunctionAbi {
         state_init: Option<&StateInit>,
     ) -> PyResult<Message> {
         let value = value.try_into()?;
-        let body = self.encode_internal_input(input)?;
+        let body = self.encode_internal_input(input, None)?;
         let body: ton_types::SliceData =
             ton_types::SliceData::load_cell(body.0).handle_value_error()?;
 
@@ -596,13 +601,35 @@ impl FunctionAbi {
         })
     }
 
-    fn encode_internal_input(&self, input: &PyDict) -> PyResult<Cell> {
+    fn encode_internal_input(&self, input: &PyDict, current_timestamp: Option<u64>) -> PyResult<Cell> {
         let tokens = parse_tokens(&self.0.inputs, input)?;
-        let input = self
+
+        // 如果提供了当前时间戳，使用它；否则使用当前时间
+        let timestamp = current_timestamp.unwrap_or_else(|| {
+            use nt::utils::Clock;
+            nt::utils::SimpleClock.now_ms_u64()
+        });
+
+        // 创建包含时间戳的headers
+        let (_, headers) = default_headers(
+            timestamp,
+            nt::core::models::Expiration::Timeout(DEFAULT_TIMEOUT),
+            None,
+        );
+
+        // 使用headers创建payload
+        let (payload, _) = self
             .0
-            .encode_internal_input(&tokens)
+            .create_unsigned_call(
+                &headers,
+                &tokens,
+                false,
+                true,
+                None,
+            )
             .handle_runtime_error()?;
-        input.into_cell().map(Cell).handle_runtime_error()
+
+        payload.into_cell().map(Cell).handle_runtime_error()
     }
 
     fn decode_transaction(
@@ -735,10 +762,11 @@ impl FunctionAbiWithArgs {
         state_init: Option<&StateInit>,
         timeout: Option<u32>,
         clock: Option<&Clock>,
+        current_timestamp: Option<u64>,
     ) -> PyResult<UnsignedExternalMessage> {
         let input = self.args.as_ref(py);
         self.abi
-            .encode_external_message(dst, input, public_key, state_init, timeout, clock)
+            .encode_external_message(dst, input, public_key, state_init, timeout, clock, current_timestamp)
     }
 
     fn encode_external_input(
@@ -748,10 +776,11 @@ impl FunctionAbiWithArgs {
         timeout: Option<u32>,
         address: Option<&Address>,
         clock: Option<&Clock>,
+        current_timestamp: Option<u64>,
     ) -> PyResult<UnsignedBody> {
         let input = self.args.as_ref(py);
         self.abi
-            .encode_external_input(input, public_key, timeout, address, clock)
+            .encode_external_input(input, public_key, timeout, address, clock, current_timestamp)
     }
 
     fn encode_internal_message(
@@ -768,9 +797,9 @@ impl FunctionAbiWithArgs {
             .encode_internal_message(input, value, bounce, dst, src, state_init)
     }
 
-    fn encode_internal_input(&self, py: Python<'_>) -> PyResult<Cell> {
+    fn encode_internal_input(&self, py: Python<'_>, current_timestamp: Option<u64>) -> PyResult<Cell> {
         let input = self.args.as_ref(py);
-        self.abi.encode_internal_input(input)
+        self.abi.encode_internal_input(input, current_timestamp)
     }
 
     fn __repr__(&self) -> String {
@@ -1047,6 +1076,24 @@ impl UnsignedExternalMessage {
         self.fill_body(py, self.body.without_signature()?)
     }
 
+    fn add_signature(
+        &self,
+        py: Python<'_>,
+        signature: Option<&PyAny>,
+    ) -> PyResult<Py<SignedExternalMessage>> {
+        let signature_bytes = match signature {
+            Some(s) => {
+                if s.is_none() {
+                    None
+                } else {
+                    Some(s.downcast::<PyBytes>()?.as_bytes())
+                }
+            }
+            None => None,
+        };
+        self.fill_body(py, self.body.fill_signature(signature_bytes)?)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "<UnsignedExternalMessage hash='{:x}', expire_at={}>",
@@ -1099,6 +1146,20 @@ impl UnsignedBody {
 
     fn without_signature(&self) -> PyResult<Cell> {
         self.fill_signature(None)
+    }
+
+    fn add_signature(&self, signature: Option<&PyAny>) -> PyResult<Cell> {
+        let signature_bytes = match signature {
+            Some(s) => {
+                if s.is_none() {
+                    None
+                } else {
+                    Some(s.downcast::<PyBytes>()?.as_bytes())
+                }
+            }
+            None => None,
+        };
+        self.fill_signature(signature_bytes)
     }
 
     fn __repr__(&self) -> String {
